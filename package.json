@@ -1,20 +1,33 @@
 {
-  "name": "node-express-api",
-  "description": "Simple api sample in Node",
-  "version": "1.0.0",
-  "private": true,
-  "main": "index.js",
+  "name": "functions",
+  "description": "Cloud Functions for Firebase",
   "type": "module",
   "scripts": {
+    "lint": "eslint .",
+    "serve": "firebase emulators:start --only functions",
+    "shell": "firebase functions:shell",
+    "start": "npm run shell",
     "dev": "nodemon index.js",
-    "start": "node index.js"
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log"
   },
-  "author": "Google LLC",
-  "license": "Apache-2.0",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
   "dependencies": {
-    "express": "^4.21.2"
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^17.2.1",
+    "express": "^4.21.2",
+    "firebase-admin": "^12.1.0",
+    "firebase-functions": "^5.0.1",
+    "mysql2": "^3.14.3",
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
+    "eslint": "^8.15.0",
+    "firebase-functions-test": "^3.3.0",
     "nodemon": "^3.0.1"
-  }
+  },
+  "private": true
 }
