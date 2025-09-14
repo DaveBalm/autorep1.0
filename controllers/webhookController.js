@@ -1,4 +1,4 @@
-// controllers/webhookController.js
+// inside webhookHandler.js
 import pool from "../config/db.js";
 import { searchTopK } from "../services/vectorService.js";
 import { generateReply } from "../services/chatService.js";
@@ -12,10 +12,9 @@ export const webhookVerify = (req, res) => {
 
   if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
     console.log("✅ Webhook verified");
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
+    return res.status(200).send(challenge);
   }
+  return res.sendStatus(403);
 };
 
 export const webhookHandler = async (req, res) => {
@@ -26,9 +25,9 @@ export const webhookHandler = async (req, res) => {
     for (const entry of body.entry) {
       const fbPageId = entry.id;
 
-      // 1) Find our internal page + user (multi-tenant)
+      // 1) Find page + user + reply mode
       const [pageRows] = await pool.execute(
-        `SELECT p.id, p.user_id, p.page_id, p.page_name, p.access_token
+        `SELECT p.id, p.user_id, p.page_id, p.page_name, p.access_token, p.reply_mode
          FROM fb_pages p
          WHERE p.page_id = ?
          LIMIT 1`,
@@ -40,48 +39,71 @@ export const webhookHandler = async (req, res) => {
         continue;
       }
 
-      // 2) FEED comment events
+      // 2) Handle feed comments
       if (entry.changes) {
         for (const change of entry.changes) {
           if (change.field === "feed" && change.value?.item === "comment") {
-            const comment = change.value; // FB payload shape
-            const commenterId = comment.from?.id; // PSID of commenter (may be null in some cases)
+            const comment = change.value;
+            const commenterId = comment.from?.id || null;
+            const commenterName = comment.from?.name || null;
             const commentText = comment.message || "";
             const commentId = comment.comment_id;
+            const postId = comment.post_id || null;
 
-            // 2a) Store raw comment
+            // Only handle tracked posts
+            const [postRows] = await pool.execute(
+              `SELECT 1 FROM user_selected_posts WHERE post_id = ? AND user_id = ? LIMIT 1`,
+              [postId, page.user_id]
+            );
+            if (postRows.length === 0) {
+              console.log(`⚠️ Ignoring comment ${commentId} — post ${postId} not tracked by user ${page.user_id}`);
+              continue;
+            }
+
+            // Save raw comment
             const [ins] = await pool.execute(
-              `INSERT INTO fb_comments (page_id, comment_id, commenter_name, comment_text)
-               VALUES (?, ?, ?, ?)`,
-              [page.id, commentId, comment.from?.name || null, commentText]
+              `INSERT INTO fb_comments (user_id, page_id, comment_id, commenter_name, comment_text, post_id)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON DUPLICATE KEY UPDATE comment_text = VALUES(comment_text)`,
+              [page.user_id, page.page_id, commentId, commenterName, commentText, postId]
             );
             const fbCommentDbId = ins.insertId;
+            console.log(`💾 Saved comment ${commentId} (post: ${postId}) from ${commenterName}`);
 
-            // 3) Retrieve context (RAG)
+            // RAG search
             const top = await searchTopK(page.user_id, commentText, 5);
 
-            // 4) Generate reply
+            // Generate AI reply
             const replyText = await generateReply({
               businessName: page.page_name || "our business",
               customerText: commentText,
               contextSnippets: top,
             });
 
-            // 5) DM the commenter (only if we have a PSID)
+            // Send reply depending on reply_mode
             let status = "pending";
             try {
-              if (commenterId) {
+              if (page.reply_mode === "dm" && commenterId) {
                 await sendDMWithToken(page.access_token, commenterId, replyText);
                 status = "sent";
               } else {
-                status = "failed"; // cannot DM without PSID
+                // fallback → public comment reply
+                await fetch(
+                  `https://graph.facebook.com/v23.0/${commentId}/comments?access_token=${page.access_token}`,
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ message: replyText }),
+                  }
+                );
+                status = "sent";
               }
             } catch (e) {
-              console.error("❌ DM error:", e.message);
+              console.error("❌ Reply error:", e.message);
               status = "failed";
             }
 
-            // 6) Log reply status
+            // Save reply status
             await pool.execute(
               `INSERT INTO replies (comment_id, reply_text, status, sent_at)
                VALUES (?, ?, ?, CASE WHEN ?='sent' THEN NOW() ELSE NULL END)`,
@@ -93,20 +115,20 @@ export const webhookHandler = async (req, res) => {
         }
       }
 
-      // (Optional) Messenger DMs (if you also want to RAG-reply in DM threads)
+      // (Optional) Messenger messages
       if (entry.messaging) {
         for (const event of entry.messaging) {
           if (event.message?.text) {
-            // You can reuse the same RAG pipeline here if desired.
-            // (Left out for brevity.)
+            console.log("💬 Incoming DM:", event.message.text);
+            // Could reuse the same logic here
           }
         }
       }
     }
 
-    res.status(200).send("EVENT_RECEIVED");
+    return res.status(200).send("EVENT_RECEIVED");
   } catch (err) {
     console.error("❌ Webhook error:", err);
-    res.sendStatus(500);
+    return res.sendStatus(500);
   }
 };

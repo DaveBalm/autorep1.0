@@ -1,66 +1,107 @@
 // services/vectorService.js
 import pool from "../config/db.js";
-import { embeddingModel } from "../config/gemini.js";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-/** Get embedding for a single string */
-export async function embedText(text) {
-  const result = await embeddingModel.embedContent({ content: text });
-  return result.embedding.values; // Float32[]
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+const embeddingModel = genAI.getGenerativeModel({ model: "text-embedding-004" });
+
+/**
+ * Generate embedding for a text using Gemini
+ */
+export async function generateEmbedding(text) {
+  const resp = await embeddingModel.embedContent(text);
+  return resp.embedding.values; // ✅ array of floats
 }
 
-/** Save chunks + embeddings for a resource */
+/**
+ * Save resource chunks into DB with embeddings
+ */
 export async function saveResourceChunks(resourceId, chunks) {
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    for (const content of chunks) {
-      const embedding = await embedText(content);
-      await conn.execute(
-        `INSERT INTO resource_vectors (resource_id, content, embedding)
-         VALUES (?, ?, ?)`,
-        [resourceId, content, JSON.stringify(embedding)]
-      );
+  let count = 0;
+
+  for (const chunk of chunks) {
+    // 1️⃣ Generate embedding
+    const embedding = await generateEmbedding(chunk);
+
+    // 2️⃣ Convert to JSON string
+    const embJson = JSON.stringify(embedding);
+
+    // 3️⃣ Validate JSON format (must be an array)
+    try {
+      const parsed = JSON.parse(embJson);
+      if (!Array.isArray(parsed)) {
+        throw new Error("Embedding is not a JSON array");
+      }
+    } catch (err) {
+      console.error(`❌ Invalid embedding for chunk: "${chunk.slice(0, 30)}..."`, err.message);
+      continue; // skip bad embedding instead of breaking all
     }
-    await conn.commit();
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
+
+    // 4️⃣ Insert into DB
+    await pool.execute(
+      `INSERT INTO resource_vectors (resource_id, content, embedding)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE 
+         content = VALUES(content), 
+         embedding = VALUES(embedding)`,
+      [resourceId, chunk, embJson]
+    );
+
+    count++;
   }
+
+  return count;
 }
 
-/** Cosine similarity (arrays of equal length) */
-function cosine(a, b) {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-8);
-}
 
-/** Vector search across a user's resources (topK) */
-export async function searchTopK(userId, query, topK = 5) {
-  const qEmb = await embedText(query);
+/**
+ * Semantic search: find top K similar chunks for a query
+ */
+export async function searchTopK(userId, query, k = 5) {
+  // 1️⃣ Get query embedding
+  const queryEmbedding = await generateEmbedding(query);
 
-  // Pull a manageable candidate set (optimize later w/ TiDB VECTOR index)
+  // 2️⃣ Pull all resource vectors for user
   const [rows] = await pool.execute(
-    `SELECT rv.id, rv.resource_id, rv.content, rv.embedding
+    `SELECT rv.id, rv.content, rv.embedding, r.title, r.resource_type
      FROM resource_vectors rv
-     JOIN resources r ON r.id = rv.resource_id
-     WHERE r.user_id = ?
-     ORDER BY rv.id DESC
-     LIMIT 500`,
+     JOIN resources r ON rv.resource_id = r.id
+     WHERE r.user_id = ?`,
     [userId]
   );
 
-  const scored = rows.map(r => {
-    const emb = JSON.parse(r.embedding);
-    return { ...r, score: cosine(qEmb, emb) };
-  });
+  if (rows.length === 0) return [];
 
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, topK).map(({ id, resource_id, content, score }) => ({ id, resource_id, content, score }));
+  // 3️⃣ Cosine similarity
+  const cosineSim = (a, b) => {
+    let dot = 0.0, normA = 0.0, normB = 0.0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  };
+
+  // 4️⃣ Parse embeddings safely
+  const scored = rows.map((row) => {
+    try {
+      const emb = JSON.parse(row.embedding);
+      if (!Array.isArray(emb)) throw new Error("Embedding is not an array");
+
+      return {
+        content: row.content,
+        title: row.title,
+        type: row.resource_type,
+        score: cosineSim(queryEmbedding, emb),
+      };
+    } catch (err) {
+      console.warn(`⚠️ Skipping row ${row.id}, invalid embedding:`, err.message);
+      return null;
+    }
+  }).filter(Boolean); // remove nulls
+
+  // 5️⃣ Sort by score and return top-K
+  return scored.sort((a, b) => b.score - a.score).slice(0, k);
 }
+
