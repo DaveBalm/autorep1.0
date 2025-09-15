@@ -136,7 +136,7 @@ Customer comments: “How much is the cream?”
 AutoRep searches the resource database.
 
 Instantly replies:
-“Our Hydrate & Renew Cream is ₦12,000. It helps reduce stretch marks and fine lines ✨. Would you like us to reserve one for you?”
+“Our Hydrate & Renew Cream is $120. It helps reduce stretch marks and fine lines ✨. Would you like us to reserve one for you?”
 
 Instead of silence → a lead turns into a sale.
 
